@@ -1,0 +1,251 @@
+name: release-please
+
+# On every push to master:
+#   1. release-please opens/updates the release PR, or, when a release PR was just merged,
+#      creates the tag + GitHub Release.
+#   2. auto-merge: approves and squash-merges the release PR (skip with the "release: hold"
+#      label, or turn off with the repo variable AUTO_MERGE_RELEASE_PR=false). The merge is
+#      a push to master by the bot, which runs this workflow again for step 1's release.
+#   3. sync-branches: after a release, brings the release commit into rc and develop.
+#      rc is only ever fast-forwarded. develop is fast-forwarded when possible; otherwise
+#      the repo variable SYNC_MODE decides:
+#        merge  (default) a merge commit on develop; needs "Require linear history" OFF on develop and rc
+#        rebase           develop's new commits are rebased onto the release and force-pushed
+#                         (with lease); keeps history linear, rewrites those commits' hashes
+#      Anything that can't be done automatically fails the run and alerts Slack.
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: release-please-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      release_created: ${{ steps.release.outputs.release_created }}
+      tag_name: ${{ steps.release.outputs.tag_name }}
+    steps:
+      # Uses the default GITHUB_TOKEN on purpose: the release PR is then authored by
+      # github-actions[bot], so the release bot (a different identity) can approve it.
+      # Config comes from release-please-config.json + .release-please-manifest.json.
+      - uses: googleapis/release-please-action@v4
+        id: release
+        with:
+          target-branch: master
+
+  auto-merge:
+    needs: release-please
+    if: needs.release-please.outputs.release_created != 'true' && vars.AUTO_MERGE_RELEASE_PR != 'false'
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - name: Bot token (GitHub App)
+        id: app-token
+        if: vars.RELEASE_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - name: Approve and merge the release PR
+        id: merge
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$GH_TOKEN" ]; then
+            echo "result=no-token" >> "$GITHUB_OUTPUT"
+            echo "::error::No bot token. Set RELEASE_BOT_APP_ID + RELEASE_BOT_PRIVATE_KEY, or RELEASE_BOT_TOKEN, in the release environment."
+            exit 1
+          fi
+
+          pr=$(gh pr list -R "$GITHUB_REPOSITORY" --base master --state open --label 'autorelease: pending' \
+                 --json number,title,labels --jq '.[0] // empty')
+          if [ -z "$pr" ]; then
+            echo "No open release PR (nothing releasable since the last release)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          number=$(jq -r .number <<< "$pr")
+          title=$(jq -r .title <<< "$pr")
+          if jq -e '.labels | map(.name) | index("release: hold")' <<< "$pr" > /dev/null; then
+            echo "## ⏸️ #$number ($title) has the \"release: hold\" label, not merging" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          gh pr review "$number" -R "$GITHUB_REPOSITORY" --approve --body "Auto-approved release PR." \
+            || echo "::warning::Could not approve #$number (fine if reviews aren't required)"
+
+          if gh pr merge "$number" -R "$GITHUB_REPOSITORY" --squash --delete-branch; then
+            echo "## ✅ Merged release PR #$number ($title)" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "result=merge-failed" >> "$GITHUB_OUTPUT"
+            echo "detail=could not merge release PR #$number ($title)" >> "$GITHUB_OUTPUT"
+            echo "## ❌ Could not merge release PR #$number ($title)" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Could not merge release PR #$number. Check required reviews/checks and that the bot may push to master."
+            exit 1
+          fi
+
+      - name: Alert Slack
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CI_WEBHOOK_URL }}
+          DETAIL: ${{ steps.merge.outputs.detail }}
+        run: |
+          [ -n "$SLACK_WEBHOOK_URL" ] || { echo "::warning::SLACK_CI_WEBHOOK_URL unset, skipping Slack post"; exit 0; }
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          text="🚨 *$GITHUB_REPOSITORY*: the release PR was NOT merged automatically.
+          ${DETAIL:-The auto-merge job failed unexpectedly.}
+          Merge it by hand, or check the run. <$run_url|Open the run>"
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -sS --fail-with-body -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d @-
+
+  sync-branches:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    environment: release
+    concurrency:
+      group: sync-branches-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      - name: Bot token (GitHub App)
+        id: app-token
+        if: vars.RELEASE_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Sync rc and develop with the release
+        id: sync
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          SYNC_MODE: ${{ vars.SYNC_MODE || 'merge' }}
+        run: |
+          set -euo pipefail
+          git config user.name 'release-bot'
+          git config user.email 'release-bot@users.noreply.github.com'
+
+          release=$(git rev-parse HEAD)
+          short=$(git rev-parse --short HEAD)
+          echo "## Syncing $TAG (\`$short\`) into rc and develop (mode: $SYNC_MODE)" >> "$GITHUB_STEP_SUMMARY"
+
+          fail() {
+            echo "result=$1" >> "$GITHUB_OUTPUT"
+            echo "detail=$2" >> "$GITHUB_OUTPUT"
+            echo "- ❌ $2" >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::$2"
+            exit 1
+          }
+
+          case "$SYNC_MODE" in merge|rebase) ;; *) fail bad-mode "SYNC_MODE must be 'merge' or 'rebase', got '$SYNC_MODE'" ;; esac
+
+          for branch in rc develop; do
+            synced=false
+            for attempt in 1 2 3; do
+              git fetch -q origin "$branch"
+              before=$(git rev-parse "origin/$branch")
+
+              if git merge-base --is-ancestor "$release" "$before"; then
+                echo "- ✅ \`$branch\` already contains \`$short\`" >> "$GITHUB_STEP_SUMMARY"
+                synced=true; break
+              fi
+
+              if git merge-base --is-ancestor "$before" "$release"; then
+                if git push -q origin "$release:refs/heads/$branch"; then
+                  echo "- ✅ \`$branch\` fast-forwarded to \`$short\`" >> "$GITHUB_STEP_SUMMARY"
+                  synced=true; break
+                fi
+                echo "::warning::$branch moved while pushing (attempt $attempt), retrying"
+                continue
+              fi
+
+              if [ "$branch" = "rc" ]; then
+                fail rc-diverged "rc has commits master doesn't ($(git log --format=%h "$release..$before" | paste -sd, -)); rc was not synced"
+              fi
+
+              git checkout -q --detach "$before"
+
+              if [ "$SYNC_MODE" = merge ]; then
+                if ! git merge -q --no-ff -m "chore: sync release $TAG into develop" "$release"; then
+                  conflicts=$(git diff --name-only --diff-filter=U | paste -sd, -)
+                  git merge --abort
+                  fail develop-conflict "merging $TAG into develop conflicts in: $conflicts"
+                fi
+                if git push -q origin "HEAD:refs/heads/$branch"; then
+                  echo "- ✅ \`$branch\` had new commits, so $TAG was merged into it (\`$(git rev-parse --short HEAD)\`)" >> "$GITHUB_STEP_SUMMARY"
+                  synced=true; break
+                fi
+              else
+                moved=$(git log --oneline --no-decorate "$release..$before")
+                if ! git rebase -q "$release"; then
+                  conflicts=$(git diff --name-only --diff-filter=U | paste -sd, -)
+                  git rebase --abort
+                  fail develop-conflict "rebasing develop onto $TAG conflicts in: $conflicts"
+                fi
+                if git push -q --force-with-lease="$branch:$before" origin "HEAD:refs/heads/$branch"; then
+                  {
+                    echo "- ✅ \`$branch\` had new commits, so they were rebased onto $TAG and force-pushed (\`$(git rev-parse --short HEAD)\`). Rewritten:"
+                    echo '```'
+                    echo "$moved"
+                    echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
+                  echo "result=develop-rebased" >> "$GITHUB_OUTPUT"
+                  synced=true; break
+                fi
+              fi
+              echo "::warning::$branch moved while pushing (attempt $attempt), retrying"
+            done
+
+            if [ "$synced" != true ]; then
+              fail push-failed "could not push $branch after 3 attempts (it kept moving, or the bot isn't allowed to push it)"
+            fi
+          done
+
+      - name: Alert Slack
+        if: always() && (failure() || steps.sync.outputs.result == 'develop-rebased')
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_CI_WEBHOOK_URL }}
+          TAG: ${{ needs.release-please.outputs.tag_name }}
+          RESULT: ${{ steps.sync.outputs.result }}
+          DETAIL: ${{ steps.sync.outputs.detail }}
+        run: |
+          [ -n "$SLACK_WEBHOOK_URL" ] || { echo "::warning::SLACK_CI_WEBHOOK_URL unset, skipping Slack post"; exit 0; }
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          case "$RESULT" in
+            develop-rebased)
+              text="ℹ️ *$GITHUB_REPOSITORY*: \`develop\` was rebased onto release \`$TAG\` and force-pushed.
+          If you have develop locally: \`git fetch && git switch develop && git reset --keep origin/develop\`
+          <$run_url|Open the run>" ;;
+            develop-conflict)
+              text="🚨 *$GITHUB_REPOSITORY*: release \`$TAG\` was NOT synced back.
+          $DETAIL
+          Sync it by hand: \`git switch develop && git pull --ff-only && git merge origin/master\`, resolve, push.
+          <$run_url|Open the run>" ;;
+            rc-diverged)
+              text="🚨 *$GITHUB_REPOSITORY*: release \`$TAG\` was NOT synced back.
+          $DETAIL
+          rc has commits that never reached master. Check them before syncing.
+          <$run_url|Open the run>" ;;
+            *)
+              text="🚨 *$GITHUB_REPOSITORY*: release \`$TAG\` was NOT synced back.
+          ${DETAIL:-The sync job failed unexpectedly.}
+          <$run_url|Open the run>" ;;
+          esac
+          jq -n --arg text "$text" '{text: $text}' \
+            | curl -sS --fail-with-body -X POST "$SLACK_WEBHOOK_URL" -H 'Content-Type: application/json' -d @-

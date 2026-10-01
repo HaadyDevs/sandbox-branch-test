@@ -1,0 +1,7 @@
+{
+  "name": "sandbox-branch-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sandbox for testing the promote, release and back-sync workflows. Dummy content only.",
+  "scripts": {}
+}

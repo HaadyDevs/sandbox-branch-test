@@ -1,0 +1,174 @@
+name: Promote
+
+# Manual "Promote" button: Actions → Promote → Run workflow.
+#
+# - "develop → rc" and "rc → master" fast-forward the target branch, optionally only up to
+#   a given commit. They never force-push and never create merge commits.
+# - "cherry-pick → rc" copies only the listed develop commits onto rc (git cherry-pick -x),
+#   for when a ready commit sits on top of commits that are not ready yet. After the
+#   release, the sync job brings master back into develop, so the branches reconverge.
+#
+# With dry_run (the default) nothing is pushed; the run summary shows what would happen.
+#
+# The button only appears when this file is on the default branch (develop).
+on:
+  workflow_dispatch:
+    inputs:
+      promotion:
+        description: 'Promotion'
+        type: choice
+        required: true
+        options:
+          - 'develop → rc'
+          - 'rc → master'
+          - 'cherry-pick → rc'
+      commits:
+        description: 'develop → rc / rc → master: optional commit to promote up to. cherry-pick → rc: the commits to copy, separated by spaces'
+        required: false
+        default: ''
+      dry_run:
+        description: 'Dry run: only show what would happen'
+        type: boolean
+        default: true
+
+concurrency:
+  group: promote-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    # The bot's secrets live in these environments. Limit each environment to the develop
+    # branch (Settings → Environments → Deployment branches), and add required reviewers to
+    # promote-production to make a second person approve each promotion to master.
+    environment: ${{ inputs.promotion == 'rc → master' && 'promote-production' || 'promote-staging' }}
+    steps:
+      - name: Bot token (GitHub App)
+        id: app-token
+        if: vars.RELEASE_BOT_APP_ID != ''
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.RELEASE_BOT_APP_ID }}
+          private-key: ${{ secrets.RELEASE_BOT_PRIVATE_KEY }}
+
+      - name: Check a bot token is available
+        env:
+          TOKEN: ${{ steps.app-token.outputs.token || secrets.RELEASE_BOT_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::No bot token. Set the RELEASE_BOT_APP_ID variable + RELEASE_BOT_PRIVATE_KEY secret, or the RELEASE_BOT_TOKEN secret, in this environment."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ steps.app-token.outputs.token || secrets.RELEASE_BOT_TOKEN }}
+
+      - name: Promote
+        env:
+          PROMOTION: ${{ inputs.promotion }}
+          COMMITS: ${{ inputs.commits }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: |
+          set -euo pipefail
+          git config user.name 'release-bot'
+          git config user.email 'release-bot@users.noreply.github.com'
+
+          summary() { echo "$*" >> "$GITHUB_STEP_SUMMARY"; }
+          fail() { summary "## ❌ $1"; echo "::error::$1" >&2; exit 1; }
+          resolve() {
+            git rev-parse --verify --quiet "$1^{commit}" || fail "Commit '$1' does not exist in this repository"
+          }
+
+          commit_table() { # range
+            summary '| Commit | Author | Message |'
+            summary '| --- | --- | --- |'
+            git log --reverse --format='| `%h` | %an | %s |' "$1" >> "$GITHUB_STEP_SUMMARY"
+          }
+
+          fast_forward() { # source target
+            local source=$1 target=$2 sha short count
+            [ "$(wc -w <<< "$COMMITS")" -le 1 ] || fail "$source → $target takes at most one commit (promote up to it)"
+            sha=$(resolve "${COMMITS:-origin/$source}")
+            short=$(git rev-parse --short "$sha")
+
+            git merge-base --is-ancestor "$sha" "origin/$source" \
+              || fail "$short is not on $source, so it cannot be promoted from $source"
+
+            if ! git merge-base --is-ancestor "origin/$target" "$sha"; then
+              summary "## ❌ Cannot fast-forward \`$target\` to \`$short\`"
+              summary ""
+              summary "\`$target\` has commits that \`$short\` does not contain:"
+              commit_table "$sha..origin/$target"
+              echo "::error::$target has commits that $short does not contain (see the run summary)"
+              exit 1
+            fi
+
+            count=$(git rev-list --count "origin/$target..$sha")
+            [ "$count" -gt 0 ] || { summary "## ✅ \`$target\` already contains \`$short\`, nothing to promote"; exit 0; }
+
+            if [ "$DRY_RUN" = true ]; then
+              summary "## 🔍 Dry run: would move \`$target\` forward by $count commit(s) to \`$short\`"
+            else
+              summary "## 🚀 Moved \`$target\` forward by $count commit(s) to \`$short\`"
+            fi
+            summary ""
+            commit_table "origin/$target..$sha"
+            [ "$DRY_RUN" = true ] && exit 0
+
+            git push origin "$sha:refs/heads/$target"
+          }
+
+          cherry_pick_to_rc() {
+            [ -n "$COMMITS" ] || fail "cherry-pick → rc needs at least one commit"
+
+            local picks=() c sha short
+            for c in $COMMITS; do
+              sha=$(resolve "$c"); short=$(git rev-parse --short "$sha")
+              git merge-base --is-ancestor "$sha" origin/develop || fail "$short is not on develop"
+              git merge-base --is-ancestor "$sha" origin/rc && fail "$short is already on rc"
+              [ "$(git rev-list --no-walk --count --merges "$sha")" -eq 0 ] || fail "$short is a merge commit; pick the commits it merged instead"
+              picks+=("$sha")
+            done
+
+            # Apply in develop's order, whatever order they were typed in.
+            mapfile -t ordered < <(git rev-list --reverse --topo-order origin/rc..origin/develop | grep -Fx -f <(printf '%s\n' "${picks[@]}"))
+
+            git checkout -q --detach origin/rc
+            for sha in "${ordered[@]}"; do
+              if ! git cherry-pick -x "$sha" > /dev/null; then
+                local files
+                files=$(git diff --name-only --diff-filter=U | paste -sd, -)
+                git cherry-pick --abort
+                fail "$(git log -1 --format='%h %s' "$sha") does not apply cleanly on rc (conflicts in: $files). It probably depends on a commit that isn't on rc yet"
+              fi
+            done
+
+            if [ "$DRY_RUN" = true ]; then
+              summary "## 🔍 Dry run: would copy ${#ordered[@]} commit(s) from develop onto \`rc\`"
+            else
+              summary "## 🚀 Copied ${#ordered[@]} commit(s) from develop onto \`rc\`"
+            fi
+            summary ""
+            commit_table "origin/rc..HEAD"
+            summary ""
+            summary "Left behind on develop (not promoted):"
+            summary ""
+            git log --reverse --format='- `%h` %an: %s' origin/rc..origin/develop | grep -vF -f <(git rev-parse --short "${ordered[@]}") >> "$GITHUB_STEP_SUMMARY" || true
+            summary ""
+            summary "After the release, the sync job brings master back into develop, so these copies and the originals reconverge."
+            [ "$DRY_RUN" = true ] && exit 0
+
+            git push origin "HEAD:refs/heads/rc"
+          }
+
+          case "$PROMOTION" in
+            'develop → rc')     fast_forward develop rc ;;
+            'rc → master')      fast_forward rc master ;;
+            'cherry-pick → rc') cherry_pick_to_rc ;;
+            *) fail "Unknown promotion '$PROMOTION'" ;;
+          esac
