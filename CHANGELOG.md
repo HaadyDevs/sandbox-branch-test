@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.3.0](https://github.com/HaadyDevs/sandbox-branch-test/compare/v1.2.0...v1.3.0) (2026-10-01)
+
+
+### Features
+
+* P2 not ready ([5aab19a](https://github.com/HaadyDevs/sandbox-branch-test/commit/5aab19ad67ea968452a44e28e6b8491ba4bdf901))
+
 ## [1.2.0](https://github.com/HaadyDevs/sandbox-branch-test/compare/v1.1.0...v1.2.0) (2026-10-01)
 
 
