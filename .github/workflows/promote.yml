@@ -9,8 +9,10 @@ name: Promote
 #   release, the sync job brings master back into develop, so the branches reconverge.
 #
 # With dry_run (the default) nothing is pushed; the run summary shows what would happen.
+# "Up to commit" is for the two fast-forward options, "Commits to cherry-pick" for cherry-pick → rc.
 #
-# The button only appears when this file is on the default branch (develop).
+# The button only appears when this file is on the default branch (develop), and it refuses
+# to run from any other branch: "Use workflow from" must stay on develop.
 on:
   workflow_dispatch:
     inputs:
@@ -22,8 +24,12 @@ on:
           - 'develop → rc'
           - 'rc → master'
           - 'cherry-pick → rc'
-      commits:
-        description: 'develop → rc / rc → master: optional commit to promote up to. cherry-pick → rc: the commits to copy, separated by spaces'
+      up_to:
+        description: 'Up to commit (optional)'
+        required: false
+        default: ''
+      cherry_pick:
+        description: 'Commits to cherry-pick (space-separated)'
         required: false
         default: ''
       dry_run:
@@ -46,6 +52,14 @@ jobs:
     # promote-production to make a second person approve each promotion to master.
     environment: ${{ inputs.promotion == 'rc → master' && 'promote-production' || 'promote-staging' }}
     steps:
+      - name: Only run from develop
+        if: github.ref_name != 'develop'
+        run: |
+          echo "## ❌ Run this from develop" >> "$GITHUB_STEP_SUMMARY"
+          echo "\"Use workflow from\" was \`$GITHUB_REF_NAME\`. Leave it on \`develop\` for every promotion; the Promotion dropdown picks the direction." >> "$GITHUB_STEP_SUMMARY"
+          echo "::error::Run this workflow from develop (it was run from $GITHUB_REF_NAME). The Promotion dropdown picks the direction."
+          exit 1
+
       - name: Bot token (GitHub App)
         id: app-token
         if: vars.RELEASE_BOT_APP_ID != ''
@@ -71,7 +85,8 @@ jobs:
       - name: Promote
         env:
           PROMOTION: ${{ inputs.promotion }}
-          COMMITS: ${{ inputs.commits }}
+          UP_TO: ${{ inputs.up_to }}
+          PICKS: ${{ inputs.cherry_pick }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -92,8 +107,9 @@ jobs:
 
           fast_forward() { # source target
             local source=$1 target=$2 sha short count
-            [ "$(wc -w <<< "$COMMITS")" -le 1 ] || fail "$source → $target takes at most one commit (promote up to it)"
-            sha=$(resolve "${COMMITS:-origin/$source}")
+            [ -z "$PICKS" ] || fail "\"Commits to cherry-pick\" is only for cherry-pick → rc. For $source → $target, use \"Up to commit\" (or leave both empty)"
+            [ "$(wc -w <<< "$UP_TO")" -le 1 ] || fail "\"Up to commit\" takes one commit"
+            sha=$(resolve "${UP_TO:-origin/$source}")
             short=$(git rev-parse --short "$sha")
 
             git merge-base --is-ancestor "$sha" "origin/$source" \
@@ -124,10 +140,11 @@ jobs:
           }
 
           cherry_pick_to_rc() {
-            [ -n "$COMMITS" ] || fail "cherry-pick → rc needs at least one commit"
+            [ -z "$UP_TO" ] || fail "\"Up to commit\" is only for develop → rc and rc → master. For cherry-pick → rc, put the commits in \"Commits to cherry-pick\""
+            [ -n "$PICKS" ] || fail "cherry-pick → rc needs at least one commit in \"Commits to cherry-pick\""
 
             local picks=() c sha short
-            for c in $COMMITS; do
+            for c in $PICKS; do
               sha=$(resolve "$c"); short=$(git rev-parse --short "$sha")
               git merge-base --is-ancestor "$sha" origin/develop || fail "$short is not on develop"
               git merge-base --is-ancestor "$sha" origin/rc && fail "$short is already on rc"

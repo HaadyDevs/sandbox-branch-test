@@ -75,7 +75,7 @@ Check each run's **summary** page (Actions → the run) and Slack.
 
 ### S2. develop gets new work while a release goes out
 1. Commit A (`feat: A`), push `develop`, then commit B (`fix: B`), push `develop`.
-2. Promote `develop → rc` **up to A** (put A's hash in *commits*), then `rc → master`.
+2. Promote `develop → rc` **up to A** (A's hash in *Up to commit*), then `rc → master`.
 3. Release happens. `develop` has B, so it can't fast-forward.
 4. **Expect, by setting:**
    - `merge` mode + linear history **ON** → push rejected, Slack 🚨. *(This is the problem we found on mobietrain-api.)*
@@ -85,7 +85,7 @@ Check each run's **summary** page (Actions → the run) and Slack.
 
 ### S3. Cherry-pick one ready commit over untested ones
 1. Commit X (`feat: X not ready`), then Y (`fix: Y ready`, in another file: `scripts/commit.sh "fix: Y ready" src/y.txt`), push.
-2. Promote `cherry-pick → rc` with Y's hash, dry run first. **Expect:** Y copied, X listed as left behind.
+2. Promote `cherry-pick → rc` with Y's hash in *Commits to cherry-pick*, dry run first. **Expect:** Y copied, X listed as left behind.
 3. `rc → master`, release, sync.
 4. **Expect:** `develop` reconverges (merge or rebase, per `SYNC_MODE`). In merge mode Y appears twice in history; in rebase mode the original Y is dropped.
 
@@ -104,6 +104,8 @@ Check each run's **summary** page (Actions → the run) and Slack.
 - Promote with a made-up hash. **Expect:** "does not exist".
 - `rc → master` with a commit only on `develop`. **Expect:** "is not on rc".
 - Push a commit straight to `rc`, then `develop → rc`. **Expect:** "rc has commits that … does not contain".
+- Fill *Commits to cherry-pick* with `develop → rc` selected (or *Up to commit* with `cherry-pick → rc`). **Expect:** refused, naming the right field.
+- Set *Use workflow from* to `rc`. **Expect:** refused, "Run this workflow from develop".
 
 ### S7. Changelog config is used
 1. `scripts/commit.sh "docs: explain the sandbox"` plus a `feat:`, promote, release.
