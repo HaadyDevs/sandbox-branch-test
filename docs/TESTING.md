@@ -79,9 +79,9 @@ Check each run's **summary** page (Actions → the run) and Slack.
 3. Release happens. `develop` has B, so it can't fast-forward.
 4. **Expect, by setting:**
    - `merge` mode + linear history **ON** → push rejected, Slack 🚨. *(This is the problem we found on mobietrain-api.)*
-   - `merge` mode + linear history **OFF** → merge commit `chore: sync release … into develop`.
+   - `merge` mode + linear history **OFF** → merge commit `chore: sync release … into develop`. Its message lists B (`fix: B` + `Source-Link`), so release-please counts B in the next release.
    - `rebase` mode + linear ON + force push allowed → B rebased onto the release, Slack ℹ️ "develop was rebased".
-5. Then promote `develop → rc` and `rc → master`. **Expect:** both fast-forward.
+5. Then promote `develop → rc` and `rc → master`. **Expect:** both fast-forward. In `merge` mode, release-please then opens a release PR that **includes B** (it reads B from the sync merge commit).
 
 ### S3. Cherry-pick one ready commit over untested ones
 1. Commit X (`feat: X not ready`), then Y (`fix: Y ready`, in another file: `scripts/commit.sh "fix: Y ready" src/y.txt`), push.

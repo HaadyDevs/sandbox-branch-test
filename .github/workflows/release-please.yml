@@ -182,7 +182,30 @@ jobs:
               git checkout -q --detach "$before"
 
               if [ "$SYNC_MODE" = merge ]; then
-                if ! git merge -q --no-ff -m "chore: sync release $TAG into develop" "$release"; then
+                # release-please walks master newest-first by commit date and stops at the
+                # last release, so develop commits OLDER than the release commit would never
+                # be counted once this merge reaches master. List them in the merge commit as
+                # extra conventional commits (release-please reads these), skipping any whose
+                # change is already in the release (cherry-picked) and non-conventional ones.
+                release_time=$(git log -1 --format=%ct "$release")
+                footers=""
+                while read -r mark sha; do
+                  [ "$mark" = "+" ] || continue
+                  [ "$(git log -1 --format=%ct "$sha")" -le "$release_time" ] || continue
+                  subject=$(git log -1 --format=%s "$sha")
+                  grep -qE '^[a-z]+(\([^)]*\))?!?: ' <<< "$subject" || continue
+                  footers+="$subject"$'\n'"  Source-Link: $(git rev-parse --short "$sha")"$'\n'
+                  breaking=$(git log -1 --format=%b "$sha" | sed -n 's/^BREAKING[ -]CHANGE: //p' | head -1)
+                  [ -z "$breaking" ] || footers+="  BREAKING-CHANGE: $breaking"$'\n'
+                  footers+=$'\n'
+                done < <(git cherry "$release" "$before")
+
+                message=("-m" "chore: sync release $TAG into develop")
+                if [ -n "$footers" ]; then
+                  message+=("-m" "Commits from develop that predate $TAG, listed so release-please counts them:" "-m" "${footers%$'\n\n'}")
+                fi
+
+                if ! git merge -q --no-ff "${message[@]}" "$release"; then
                   conflicts=$(git diff --name-only --diff-filter=U | paste -sd, -)
                   git merge --abort
                   fail develop-conflict "merging $TAG into develop conflicts in: $conflicts"
