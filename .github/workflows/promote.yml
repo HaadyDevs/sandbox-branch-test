@@ -143,14 +143,33 @@ jobs:
             [ -z "$UP_TO" ] || fail "\"Up to commit\" is only for develop → rc and rc → master. For cherry-pick → rc, put the commits in \"Commits to cherry-pick\""
             [ -n "$PICKS" ] || fail "cherry-pick → rc needs at least one commit in \"Commits to cherry-pick\""
 
-            local picks=() c sha short
+            # A commit's patch-id is the same for an original and its cherry-picked copy.
+            patch_id() { git show "$1" | git patch-id --stable | cut -d' ' -f1; }
+
+            local picks=() skipped=() c sha short pid copy
             for c in $PICKS; do
               sha=$(resolve "$c"); short=$(git rev-parse --short "$sha")
               git merge-base --is-ancestor "$sha" origin/develop || fail "$short is not on develop"
               git merge-base --is-ancestor "$sha" origin/rc && fail "$short is already on rc"
               [ "$(git rev-list --no-walk --count --merges "$sha")" -eq 0 ] || fail "$short is a merge commit; pick the commits it merged instead"
+
+              # Empty commits are release-notes listings; copying one makes release-please
+              # count the commits it lists a second time.
+              if git diff --quiet "$sha^" "$sha"; then
+                skipped+=("\`$short\` $(git log -1 --format=%s "$sha"): empty commit (release-notes listing), not copied")
+                continue
+              fi
+
+              # Refuse a change that is already on rc as an earlier cherry-picked copy.
+              pid=$(patch_id "$sha")
+              copy=$(git rev-list "$(git merge-base origin/rc "$sha")..origin/rc" | while read -r rc_commit; do
+                       [ "$(patch_id "$rc_commit")" = "$pid" ] && { git rev-parse --short "$rc_commit"; break; }
+                     done; true)
+              [ -z "$copy" ] || fail "$short is already on rc as a cherry-picked copy ($copy)"
+
               picks+=("$sha")
             done
+            [ "${#picks[@]}" -gt 0 ] || fail "Nothing to cherry-pick: every listed commit is an empty release-notes listing"
 
             # Apply in develop's order, whatever order they were typed in.
             mapfile -t ordered < <(git rev-list --reverse --topo-order origin/rc..origin/develop | grep -Fx -f <(printf '%s\n' "${picks[@]}"))
@@ -172,6 +191,12 @@ jobs:
             fi
             summary ""
             commit_table "origin/rc..HEAD"
+            if [ "${#skipped[@]}" -gt 0 ]; then
+              summary ""
+              summary "Skipped:"
+              summary ""
+              printf -- '- ⏭️ %s\n' "${skipped[@]}" >> "$GITHUB_STEP_SUMMARY"
+            fi
             summary ""
             summary "Left behind on develop (not promoted):"
             summary ""

@@ -186,11 +186,13 @@ jobs:
                 # last release, so develop commits OLDER than the release commit would never
                 # be counted once this merge reaches master. List them in the merge commit as
                 # extra conventional commits (release-please reads these), skipping any whose
-                # change is already in the release (cherry-picked) and non-conventional ones.
+                # change is already in the release (cherry-picked), non-conventional ones, and
+                # empty ones (earlier listings: listing them would count their commits twice).
                 release_time=$(git log -1 --format=%ct "$release")
                 footers=""
                 while read -r mark sha; do
                   [ "$mark" = "+" ] || continue
+                  git diff --quiet "$sha^" "$sha" && continue
                   [ "$(git log -1 --format=%ct "$sha")" -le "$release_time" ] || continue
                   subject=$(git log -1 --format=%s "$sha")
                   grep -qE '^[a-z]+(\([^)]*\))?!?: ' <<< "$subject" || continue
@@ -216,7 +218,9 @@ jobs:
                 fi
               else
                 moved=$(git log --oneline --no-decorate "$release..$before")
-                if ! git rebase -q "$release"; then
+                # --no-keep-empty also drops commits that were empty from the start (earlier
+                # release-notes listings), which would otherwise be replayed and recounted.
+                if ! git rebase -q --no-keep-empty "$release"; then
                   conflicts=$(git diff --name-only --diff-filter=U | paste -sd, -)
                   git rebase --abort
                   fail develop-conflict "rebasing develop onto $TAG conflicts in: $conflicts"

@@ -106,6 +106,8 @@ Check each run's **summary** page (Actions → the run) and Slack.
 - Push a commit straight to `rc`, then `develop → rc`. **Expect:** "rc has commits that … does not contain".
 - Fill *Commits to cherry-pick* with `develop → rc` selected (or *Up to commit* with `cherry-pick → rc`). **Expect:** refused, naming the right field.
 - Set *Use workflow from* to `rc`. **Expect:** refused, "Run this workflow from develop".
+- `cherry-pick → rc` with only an empty commit (e.g. `git commit --allow-empty -m "fix: listing"`). **Expect:** refused, "every listed commit is an empty release-notes listing". With a real commit too: the real one is copied, the empty one is listed under *Skipped*.
+- `cherry-pick → rc` the same commit twice (run it for real once, then again). **Expect:** second run refused, "already on rc as a cherry-picked copy (…)".
 
 ### S7. Changelog config is used
 1. `scripts/commit.sh "docs: explain the sandbox"` plus a `feat:`, promote, release.
