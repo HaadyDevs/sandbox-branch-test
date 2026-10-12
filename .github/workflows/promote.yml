@@ -5,8 +5,9 @@ name: Promote
 # - "develop → rc" and "rc → master" fast-forward the target branch, optionally only up to
 #   a given commit. They never force-push and never create merge commits.
 # - "cherry-pick → rc" copies only the listed develop commits onto rc (git cherry-pick -x),
-#   for when a ready commit sits on top of commits that are not ready yet. After the
-#   release, the sync job brings master back into develop, so the branches reconverge.
+#   for when a ready commit sits on top of commits that are not ready yet. Prefer a hotfix
+#   branched from rc: a cherry-pick leaves rc with a copy develop lacks, so rc must then be
+#   merged into develop by hand before the next develop → rc fast-forward.
 #
 # With dry_run (the default) nothing is pushed; the run summary shows what would happen.
 # "Up to commit" is for the two fast-forward options, "Commits to cherry-pick" for cherry-pick → rc.
@@ -202,7 +203,7 @@ jobs:
             summary ""
             git log --reverse --format='- `%h` %an: %s' origin/rc..origin/develop | grep -vF -f <(git rev-parse --short "${ordered[@]}") >> "$GITHUB_STEP_SUMMARY" || true
             summary ""
-            summary "After the release, the sync job brings master back into develop, so these copies and the originals reconverge."
+            summary "Next: merge \`rc\` into \`develop\` (\`git switch develop && git merge origin/rc\`), otherwise the next \`develop → rc\` can't fast-forward."
             [ "$DRY_RUN" = true ] && exit 0
 
             git push origin "HEAD:refs/heads/rc"

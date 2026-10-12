@@ -2,57 +2,30 @@
 
 Everything here runs on GitHub only. There are no Cloud Build triggers, so nothing deploys.
 
-## 1. One-time setup on GitHub
+## How releases work now
 
-Do these after pushing `master`, `rc` and `develop`.
+- `develop → rc → master` move by **fast-forward** only (Promote button).
+- On every push to `master`, **semantic-release** (`.github/workflows/release.yml`, config `.releaserc.json`) reads the commits since the last `v*` tag and, if any are releasable, creates the next tag and a **GitHub Release** with the notes.
+  - `feat:` → minor, `fix:` / `perf:` → patch, `!` or `BREAKING CHANGE:` → major.
+  - `chore:`, `docs:`, `ci:`, `test:`, `refactor:` … → no release.
+- **Nothing is committed back**, so `rc` and `develop` never need syncing after a release. No release PR, no release commit, no merge commits from releases.
+- `CHANGELOG.md` is frozen at v1.3.0; the Releases page is the changelog from then on.
+- In a real repo, the build sets the version from the tag before building: `npm pkg set version=${TAG#v}`.
 
-### Repository settings (Settings → General)
-- **Default branch:** `develop` (the Promote button only appears for workflows on the default branch).
-- **Pull Requests:** allow **squash merging** only (like `mobietrain-api`), tick **Allow auto-merge** and **Automatically delete head branches**.
+The only remaining back-merges come from a **hotfix into `rc`** or a **cherry-pick**: `rc` then has a commit `develop` lacks, so merge `rc` into `develop` by hand once.
 
-### Actions (Settings → Actions → General)
-- **Workflow permissions:** *Read and write permissions*.
-- Tick **Allow GitHub Actions to create and approve pull requests** (release-please needs it to open the release PR).
+## 1. Setup on GitHub
 
-### Bot identity (pick one)
-- **GitHub App (preferred):** Settings → Developer settings → GitHub Apps → New. No webhook. Repository permissions: **Contents: Read and write**, **Pull requests: Read and write**. Install it on this repo only. Generate a private key.
-  - Variable `RELEASE_BOT_APP_ID` = the App ID
-  - Secret `RELEASE_BOT_PRIVATE_KEY` = the private key (.pem contents)
-- **Fine-grained PAT (quick start):** this repo only, **Contents: Read and write**, **Pull requests: Read and write**.
-  - Secret `RELEASE_BOT_TOKEN`
+Already done for the earlier tests. What matters now:
 
-### Environments (Settings → Environments)
-Create three. Put the bot variable/secrets above **in each environment** (not as repo secrets), so only these jobs can use them.
+- **Default branch:** `develop`.
+- **Actions → General → Workflow permissions:** *Read and write*.
+- **Secret** `RELEASE_BOT_TOKEN` (fine-grained PAT, this repo only, **Contents: Read and write**). Used by Promote and by `release.yml`.
+- **Branch protection:** force pushes **off** everywhere. **Require linear history** must stay **OFF** on `develop` and `rc`: releases no longer create merge commits, but merging `rc` back into `develop` after a hotfix or cherry-pick (T5, T6) still does, and that merge commit reaches `rc` at the next promotion. `master` can have it either way.
 
-| Environment | Deployment branches | Used by | Extra |
-| --- | --- | --- | --- |
-| `release` | `master` only | auto-merge, sync | add secret `SLACK_CI_WEBHOOK_URL` |
-| `promote-staging` | `develop` only | Promote: `develop → rc`, `cherry-pick → rc` | — |
-| `promote-production` | `develop` only | Promote: `rc → master` | optional: required reviewer |
-
-### Variables (Settings → Secrets and variables → Actions → Variables)
-- `SYNC_MODE` = `merge` or `rebase` (default `merge`)
-- `AUTO_MERGE_RELEASE_PR` = `false` to turn off auto-merge (default on)
-
-### Label
-- Create a label named `release: hold`.
-
-### Branch protection (Settings → Branches), mirroring `mobietrain-api`
-
-| Branch | Require PR + reviews | Require linear history | Allow force pushes |
-| --- | --- | --- | --- |
-| `develop` | yes, 1 | **depends on SYNC_MODE** (below) | only for `rebase` mode |
-| `rc` | yes, 1 | **depends on SYNC_MODE** | no |
-| `master` | yes, 1 | no | **no** |
-
-- `SYNC_MODE=merge` needs **linear history OFF** on `develop` and `rc` (merge commits flow to `rc` at the next promotion).
-- `SYNC_MODE=rebase` keeps **linear history ON**, and needs **force pushes allowed** on `develop`.
-- Leave "Do not allow bypassing the above settings" **unticked**, so you (admin) and a PAT acting as you can push directly while testing alone.
-- If you use the App: add it to the bypass list if GitHub offers it. If its pushes are rejected, that's a finding (personal repos have limited bypass options); switch to the PAT to keep testing.
+No longer used (safe to delete): variables `SYNC_MODE` and `AUTO_MERGE_RELEASE_PR`, label `release: hold`, environment `release`.
 
 ## 2. Making test commits
-
-Push straight to `develop` (admin bypass) or via PRs:
 
 ```bash
 git switch develop
@@ -64,55 +37,45 @@ git push origin develop
 
 ## 3. Scenarios
 
-Check each run's **summary** page (Actions → the run) and Slack.
+Check each run's **summary/log** (Actions → the run) and the **Releases** page.
 
-### S1. Normal release, nothing new on develop
-1. `scripts/commit.sh "feat: first feature"`, push `develop`.
-2. Promote `develop → rc`, dry run ✅. **Expect:** a table with 1 commit, nothing pushed.
-3. Promote `develop → rc`, dry run ☐. **Expect:** `rc` moves to that commit.
-4. Promote `rc → master`. **Expect:** `master` moves.
-5. **Expect:** release-please opens `chore(master): release 1.1.0`, auto-merge approves and merges it within a minute, a `v1.1.0` tag and GitHub Release appear, and the sync job fast-forwards `rc` and `develop`. All three branches end on the release commit.
+### T1. Preview the next release (dry run)
+1. Actions → **release** → Run workflow, *Use workflow from* `master`, dry run ✅.
+2. **Expect:** the log names the last release (`v1.3.0`) and either "no release" or the next version with its notes. Nothing is tagged.
 
-### S2. develop gets new work while a release goes out
-1. Commit A (`feat: A`), push `develop`, then commit B (`fix: B`), push `develop`.
-2. Promote `develop → rc` **up to A** (A's hash in *Up to commit*), then `rc → master`.
-3. Release happens. `develop` has B, so it can't fast-forward.
-4. **Expect, by setting:**
-   - `merge` mode + linear history **ON** → push rejected, Slack 🚨. *(This is the problem we found on mobietrain-api.)*
-   - `merge` mode + linear history **OFF** → merge commit `chore: sync release … into develop`. Its message lists B (`fix: B` + `Source-Link`), so release-please counts B in the next release.
-   - `rebase` mode + linear ON + force push allowed → B rebased onto the release, Slack ℹ️ "develop was rebased".
-5. Then promote `develop → rc` and `rc → master`. **Expect:** both fast-forward. In `merge` mode, release-please then opens a release PR that **includes B** (it reads B from the sync merge commit).
+### T2. Normal release, continuing the numbering
+1. `scripts/commit.sh "feat: T2 feature"`, push `develop`.
+2. Promote `develop → rc`, then `rc → master`.
+3. **Expect:** tag `v1.4.0` and a GitHub Release with "T2 feature" under **Features**.
+4. **Expect:** **no new commit** on `master`; `master`, `rc` and `develop` are all at the same commit. Nothing to sync.
 
-### S3. Cherry-pick one ready commit over untested ones
-1. Commit X (`feat: X not ready`), then Y (`fix: Y ready`, in another file: `scripts/commit.sh "fix: Y ready" src/y.txt`), push.
-2. Promote `cherry-pick → rc` with Y's hash in *Commits to cherry-pick*, dry run first. **Expect:** Y copied, X listed as left behind.
-3. `rc → master`, release, sync.
-4. **Expect:** `develop` reconverges (merge or rebase, per `SYNC_MODE`). In merge mode Y appears twice in history; in rebase mode the original Y is dropped.
+### T3. Non-releasable commits don't release
+1. `scripts/commit.sh "docs: T3 docs only"`, push, promote to `master`.
+2. **Expect:** the release run says no release; no new tag.
+3. Then `scripts/commit.sh "fix: T3 fix"`, push, promote. **Expect:** `v1.4.1` lists only the fix.
 
-### S4. Conflict during sync
-1. On `develop`, edit `"version"` in `package.json` by hand and commit `chore: bump version by hand`, push.
-2. Release something via S1 steps 2–4.
-3. **Expect:** sync fails on `develop`, nothing pushed, Slack 🚨 naming `package.json`.
+### T4. develop gets new work while a release goes out (the old back-merge case)
+1. Commit A (`feat: A`), push, then B (`fix: B`), push.
+2. Promote `develop → rc` **up to A**, then `rc → master`. **Expect:** release with A only.
+3. **Expect:** `develop` is untouched and still fast-forwards later: promote `develop → rc`, `rc → master`. **Expect:** the next release lists **B** (counted by history, not by date, so nothing is skipped).
 
-### S5. Holding a release
-1. Set `AUTO_MERGE_RELEASE_PR=false`, promote a `feat:` to `master`. **Expect:** the release PR stays open.
-2. Add the `release: hold` label, set `AUTO_MERGE_RELEASE_PR` back to `true` (or delete it), promote another commit to `master`.
-3. **Expect:** auto-merge skips the PR ("has the release: hold label").
-4. Remove the label, promote again. **Expect:** it merges.
+### T5. Hotfix branched from rc
+1. `git switch -c hotfix/t5 origin/rc`, `scripts/commit.sh "fix: T5 hotfix"`, push the branch, PR into `rc`, merge (or push to `rc` directly).
+2. Promote `rc → master`. **Expect:** a patch release with the hotfix.
+3. Merge `rc` into `develop` once: `git switch develop && git merge origin/rc && git push origin develop`.
+4. Promote `develop → rc` later. **Expect:** fast-forward; the hotfix is **not** listed again (it's already in the last tag's history).
 
-### S6. Refusals
-- Promote with a made-up hash. **Expect:** "does not exist".
+### T6. Cherry-pick (expect a duplicate in the notes)
+1. Commit X (`feat: X not ready`), then Y (`fix: Y ready` in `src/y.txt`), push.
+2. `cherry-pick → rc` with Y, then `rc → master`. **Expect:** a release with Y.
+3. Merge `rc` into `develop` (as in T5 step 3), and later promote everything.
+4. **Expect:** the next release lists X **and Y again** (the original Y reaches `master` with a different hash). This is why hotfixes from `rc` (T5) are preferred over cherry-picks.
+
+### T7. Refusals (Promote)
+- A made-up hash. **Expect:** "does not exist".
 - `rc → master` with a commit only on `develop`. **Expect:** "is not on rc".
-- Push a commit straight to `rc`, then `develop → rc`. **Expect:** "rc has commits that … does not contain".
-- Fill *Commits to cherry-pick* with `develop → rc` selected (or *Up to commit* with `cherry-pick → rc`). **Expect:** refused, naming the right field.
-- Set *Use workflow from* to `rc`. **Expect:** refused, "Run this workflow from develop".
-- `cherry-pick → rc` with only an empty commit (e.g. `git commit --allow-empty -m "fix: listing"`). **Expect:** refused, "every listed commit is an empty release-notes listing". With a real commit too: the real one is copied, the empty one is listed under *Skipped*.
-- `cherry-pick → rc` the same commit twice (run it for real once, then again). **Expect:** second run refused, "already on rc as a cherry-picked copy (…)".
-
-### S7. Changelog config is used
-1. `scripts/commit.sh "docs: explain the sandbox"` plus a `feat:`, promote, release.
-2. **Expect:** `CHANGELOG.md` and the GitHub Release list the docs commit under **Documentation**. (On `mobietrain-api`, docs/test commits never appear, which suggests its config isn't applied.)
-
-### S8. Secrets are locked to the right branches
-1. On a new branch, add a workflow with `environment: release` that prints whether `secrets.RELEASE_BOT_PRIVATE_KEY` (or `RELEASE_BOT_TOKEN`) is set, and run it.
-2. **Expect:** GitHub refuses the deployment ("branch is not allowed to deploy to release"), so the token can't leak to other branches.
+- A commit pushed straight to `rc`, then `develop → rc`. **Expect:** "rc has commits that … does not contain".
+- *Commits to cherry-pick* filled with `develop → rc` selected (or *Up to commit* with `cherry-pick → rc`). **Expect:** refused, naming the right field.
+- *Use workflow from* set to `rc`. **Expect:** "Run this workflow from develop".
+- `cherry-pick → rc` with only an empty commit. **Expect:** refused. With a real commit too: the real one is copied, the empty one listed under *Skipped*.
+- `cherry-pick → rc` the same commit twice. **Expect:** the second run is refused, "already on rc as a cherry-picked copy (…)".

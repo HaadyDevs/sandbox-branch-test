@@ -1,5 +1,8 @@
 # Changelog
 
+> **From the first release after v1.3.0, release notes are on the [GitHub Releases page](https://github.com/HaadyDevs/sandbox-branch-test/releases).**
+> Releases are tag-only (semantic-release): no release commit, so this file is no longer updated.
+
 ## [1.3.0](https://github.com/HaadyDevs/sandbox-branch-test/compare/v1.2.0...v1.3.0) (2026-10-01)
 
 

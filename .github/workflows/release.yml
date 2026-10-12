@@ -1,0 +1,61 @@
+name: release
+
+# Tag-only releases with semantic-release (config: .releaserc.json).
+#
+# On every push to master it reads the conventional commits since the last v* tag
+# (feat → minor, fix/perf → patch, ! or BREAKING CHANGE → major), creates the next tag and
+# a GitHub Release with the notes. It commits NOTHING back, so rc and develop never need a
+# back-merge after a release. Builds take the version from the tag, not from package.json.
+#
+# Commits that aren't releasable (chore, docs, ci, test, refactor, …) produce no release.
+#
+# Run it by hand with dry_run ticked to preview the next version and notes without releasing.
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: only show the next version and notes'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Only run from master
+        if: github.ref_name != 'master'
+        run: |
+          echo "::error::Run this workflow from master (it was run from $GITHUB_REF_NAME)."
+          exit 1
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # A bot token (not the default GITHUB_TOKEN) so the new tag can trigger other
+      # workflows. Cloud Build triggers fire on the tag either way.
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.RELEASE_BOT_TOKEN }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: |
+          if [ "$DRY_RUN" = true ]; then
+            npx --yes semantic-release@24 --dry-run
+          else
+            npx --yes semantic-release@24
+          fi
